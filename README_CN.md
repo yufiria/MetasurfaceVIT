@@ -481,7 +481,338 @@ python evaluation/metasurface_verification/main.py \
 
 ---
 
-## 代码文档
+## 项目依赖关系
+
+### 核心依赖
+
+#### Python 环境
+- **Python**: 3.8+
+- **CUDA**: 11.6+ (支持 GPU 加速)
+- **cuDNN**: 8+ (CUDA 深度神经网络库)
+
+#### 深度学习框架
+- **PyTorch**: 1.12+ (核心深度学习框架)
+  - `torch`: 主要的张量运算和神经网络模块
+  - `torchvision`: 图像处理工具
+  - `torchaudio`: 音频处理（非必需）
+- **CUDA**: pytorch-cuda=12.1 (GPU 加速)
+
+#### 模型相关库
+- **timm** (0.6.0+): PyTorch Image Models
+  - 提供 Vision Transformer 的基础组件
+  - 学习率调度器（CosineLRScheduler, StepLRScheduler）
+  - 工具函数（AverageMeter 等）
+- **Nvidia Apex** (可选): 混合精度训练
+  - 提供 `amp` 模块用于自动混合精度
+  - 如果不安装，代码会自动使用 PyTorch 的 `torch.cuda.amp`
+
+#### 数据处理库
+- **NumPy** (1.19+): 数值计算和数组操作
+  - Jones 矩阵的数值计算
+  - 数据预处理和后处理
+- **SciPy** (1.7+): 科学计算
+  - `scipy.interpolate`: 相对位置编码的几何插值
+  - 数值优化和信号处理
+
+#### 可视化库
+- **Matplotlib** (3.3+): 绘图和可视化
+  - 训练曲线可视化
+  - Jones 矩阵可视化
+  - 超表面设计结果展示
+- **Pillow (PIL)** (8.0+): 图像处理
+  - 图像读取和保存
+  - 图像格式转换
+
+#### 配置和日志
+- **YACS** (0.1.8+): 配置管理
+  - 层次化配置系统
+  - 命令行参数与配置文件集成
+- **termcolor** (1.1.0+): 彩色终端输出
+  - 日志的彩色输出
+  - 提高可读性
+
+### 模块间依赖关系
+
+#### 1. 配置层 (Configuration Layer)
+```
+config.py
+  ├── 定义所有配置参数
+  ├── 从预处理获取数据参数
+  └── 命令行参数解析
+```
+
+**依赖**:
+- `yacs`: 配置管理
+- 被所有其他模块导入
+
+#### 2. 数据层 (Data Layer)
+```
+data/
+  ├── __init__.py          # 数据加载器统一接口
+  ├── data_simmim.py       # 预训练数据（掩码图像建模）
+  ├── data_finetune.py     # 微调数据（Jones矩阵→结构参数）
+  └── data_recon.py        # 重建数据（设计的Jones矩阵）
+```
+
+**依赖**:
+- `torch.utils.data`: DataLoader, Dataset, Sampler
+- `numpy`: 数据读取和预处理
+- `config`: 数据路径和参数配置
+
+**功能**:
+- 加载和预处理 Jones 矩阵数据
+- 实现5种掩码策略
+- 支持分布式训练的数据采样
+
+#### 3. 模型层 (Model Layer)
+```
+model/
+  ├── __init__.py              # 模型构建接口
+  ├── vision_transformer.py    # Vision Transformer 实现
+  └── simmim.py               # SimMIM 预训练框架
+```
+
+**依赖**:
+- `torch.nn`: 神经网络模块
+- `timm.models`: DropPath, trunc_normal_ 等
+- `config`: 模型架构参数
+
+**功能**:
+- **vision_transformer.py**:
+  - Patch Embedding: 将 Jones 矩阵转换为 token 序列
+  - Transformer Blocks: 自注意力和前馈网络
+  - Position Encoding: 绝对位置编码和相对位置偏置
+- **simmim.py**:
+  - 掩码 Token: 替换被掩码的 patch
+  - 编码器-解码器架构
+  - 三种损失计算方式
+
+#### 4. 训练优化层 (Training Optimization Layer)
+```
+optimizer.py          # 优化器构建
+lr_scheduler.py       # 学习率调度
+utils.py             # 工具函数
+```
+
+**依赖**:
+- `torch.optim`: Adam, AdamW, SGD
+- `timm.scheduler`: 各种学习率调度器
+- `scipy.interpolate`: 位置编码插值
+- `config`: 训练参数配置
+
+**功能**:
+- **optimizer.py**:
+  - 参数分组（权重衰减跳过）
+  - 层级学习率衰减
+- **lr_scheduler.py**:
+  - 余弦退火、线性衰减、步进衰减
+  - 预热机制
+- **utils.py**:
+  - 检查点加载/保存
+  - 预训练权重加载和重映射
+  - 梯度范数计算和裁剪
+
+#### 5. 主训练脚本层 (Main Training Layer)
+```
+main_pretrain.py     # 预训练主程序
+main_finetune.py     # 微调主程序
+main_metalens.py     # 金属透镜设计主程序
+```
+
+**依赖**:
+- 所有上述模块
+- `torch.distributed`: 分布式训练
+- `torch.cuda.amp` 或 `apex.amp`: 混合精度训练
+
+**工作流程**:
+```
+main_pretrain.py:
+  解析参数 → 初始化分布式 → 构建数据加载器 
+  → 创建 SimMIM 模型 → 构建优化器和调度器 
+  → 训练循环（掩码预训练） → 保存检查点
+
+main_finetune.py:
+  解析参数 → 加载预训练权重 → 构建微调数据 
+  → 添加回归头 → 微调训练 → 预测结构参数
+
+main_metalens.py:
+  设计金属透镜 → 迭代优化 → 参数预测 
+  → 生成 Lumerical 脚本
+```
+
+#### 6. 预处理层 (Preprocessing Layer)
+```
+preprocess/
+  ├── data_generation.py           # 数据生成脚本
+  ├── FDTD_Simulation/
+  │   └── unit_cell.py            # FDTD 单元仿真
+  └── Jones_matrix_calculation/
+      ├── jones_matrix.py         # Jones 矩阵运算
+      ├── jones_vector.py         # Jones 矢量
+      ├── double_cell.py          # 双单元计算
+      └── visualization.py        # 可视化工具
+```
+
+**依赖**:
+- `numpy`: 矩阵运算
+- `matplotlib`: 可视化
+- **Lumerical API** (外部依赖): FDTD 仿真
+
+**功能**:
+- FDTD 仿真: 计算超表面单元的电磁响应
+- Jones 矩阵计算: 从 S 参数转换为 Jones 矩阵
+- 数据生成: 生成大规模训练数据集
+
+#### 7. 评估层 (Evaluation Layer)
+```
+evaluation/
+  ├── metasurface_design/         # 超表面设计
+  │   ├── main.py
+  │   ├── JM_generator.py        # Jones 矩阵生成器
+  │   ├── image_generator.py     # 图像生成器
+  │   └── utils.py
+  └── metasurface_verification/  # 前向验证
+      ├── main.py
+      ├── predictor.py           # 前向预测器 (MLP/CNN)
+      ├── matcher.py             # 参数匹配器
+      └── visualization.py
+```
+
+**依赖**:
+- 训练好的模型
+- `torch`: 模型推理
+- `numpy`: 数据处理
+
+**功能**:
+- **metasurface_design**:
+  - 4 种设计类型（全息、打印、复用、透镜）
+  - 目标 Jones 矩阵生成
+  - 可视化设计结果
+- **metasurface_verification**:
+  - 前向网络训练（结构参数→Jones 矩阵）
+  - 预测参数验证
+  - 性能评估
+
+### 数据流依赖图
+
+```
+FDTD仿真数据
+    ↓
+Jones矩阵计算
+    ↓
+预训练数据 (training_data_X/)
+    ├── JM_train_X.txt  (Jones矩阵)
+    └── para_train_X.txt (结构参数)
+    ↓
+┌───────────────┴───────────────┐
+│                               │
+预训练阶段                    微调数据生成
+(SimMIM)                    (finetune_data_X/)
+    ↓                           ↓
+预训练模型权重              微调阶段
+    ↓                       (参数回归)
+超表面设计                      ↓
+(4种类型)                   微调模型权重
+    ↓                           ↓
+设计的Jones矩阵             参数预测
+    ↓                           ↓
+重建阶段                    前向验证
+    ↓                           ↓
+重建的Jones矩阵             验证结果
+    ↓                           
+微调数据                        
+    ↓                           
+参数预测 ────────────────────→ 最终超表面结构
+```
+
+### 外部工具依赖
+
+#### Lumerical FDTD Solutions
+- **用途**: 电磁仿真
+- **版本**: 推荐 2020 R2+
+- **文件格式**:
+  - `.fsp`: 仿真项目文件
+  - `.lsf`: Lumerical 脚本文件
+- **交互方式**: Python API 或脚本调用
+
+#### 操作系统要求
+- **Linux**: Ubuntu 18.04+ (推荐)
+- **Windows**: Windows 10+ (需要 WSL2 for Lumerical)
+- **macOS**: 不推荐（GPU 支持有限）
+
+### 安装顺序建议
+
+1. **基础环境**
+   ```bash
+   conda create -n MetasurfaceVIT python=3.8
+   conda activate MetasurfaceVIT
+   ```
+
+2. **PyTorch 和 CUDA**
+   ```bash
+   conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+   ```
+
+3. **核心依赖**
+   ```bash
+   conda install matplotlib pillow numpy scipy
+   pip install timm termcolor yacs
+   ```
+
+4. **可选: Nvidia Apex**
+   ```bash
+   git clone https://github.com/NVIDIA/apex
+   cd apex
+   pip install -v --no-cache-dir ./
+   ```
+
+5. **验证安装**
+   ```bash
+   python -c "import torch; print(torch.cuda.is_available())"
+   python -c "import timm; print(timm.__version__)"
+   ```
+
+### 常见依赖问题
+
+#### 1. CUDA 版本不匹配
+**问题**: `RuntimeError: CUDA error: no kernel image is available`
+**解决**: 确保 PyTorch 的 CUDA 版本与系统 CUDA 版本匹配
+
+#### 2. Apex 安装失败
+**问题**: 编译错误
+**解决**: 使用 PyTorch AMP 替代，添加参数 `--amp_type pytorch`
+
+#### 3. 内存不足
+**问题**: `CUDA out of memory`
+**解决**: 
+- 减小 `batch_size`
+- 增加 `accumulation_steps`
+- 使用梯度检查点 `--use_checkpoint`
+
+#### 4. 分布式训练失败
+**问题**: NCCL 初始化错误
+**解决**: 检查 `RANK` 和 `WORLD_SIZE` 环境变量
+
+### 性能优化建议
+
+#### GPU 内存优化
+- 使用混合精度训练: `--amp_type pytorch` 或 `--amp_opt_level O1`
+- 启用梯度检查点: `--use_checkpoint`
+- 调整批次大小: `--batch_size 64` (根据GPU内存调整)
+
+#### 训练速度优化
+- 使用多GPU训练: `python -m torch.distributed.launch --nproc_per_node 4`
+- 增加数据加载线程: `DATA.NUM_WORKERS = 8`
+- 启用 `cudnn.benchmark = True`
+
+#### 磁盘I/O优化
+- 预处理数据缓存到内存
+- 使用SSD存储训练数据
+- 分批次加载大规模数据集
+
+---
+
+
 
 ### 中文注释文档
 
@@ -629,6 +960,203 @@ python evaluation/metasurface_verification/main.py \
   year={2024}
 }
 ```
+
+---
+
+## 代码文档
+
+### 中文注释文档
+
+本项目的核心代码文件都已添加详细的中文注释。截至目前，已完成11个核心文件的详细注释工作。
+
+#### 已完成详细注释的文件 (11个核心文件)
+
+**1. 配置与工具模块** (5个文件)
+- ✅ **config.py** - 配置管理系统
+  - 所有配置参数的详细说明
+  - 参数更新逻辑
+  - 从预处理获取数据参数的机制
+  
+- ✅ **logger.py** - 日志系统
+  - 分布式训练环境下的日志管理
+  - 彩色控制台输出配置
+  - 文件日志记录功能
+
+- ✅ **optimizer.py** - 优化器构建
+  - 预训练和微调阶段的优化器
+  - 参数分组策略（权重衰减跳过）
+  - 层级学习率衰减的实现
+
+- ✅ **lr_scheduler.py** - 学习率调度
+  - 多种调度策略（余弦、线性、步进、多步）
+  - 预热机制实现
+  - 各调度器参数的详细说明
+
+- ✅ **utils.py** - 工具函数集合
+  - 检查点的加载和保存
+  - 梯度范数计算和裁剪
+  - 预训练权重的加载和重映射
+  - 相对位置编码的几何插值
+
+**2. 核心模型模块** (3个文件)
+- ✅ **model/vision_transformer.py** - Vision Transformer实现
+  - 完整的ViT架构实现
+  - Patch Embedding层（Jones矩阵→Token序列）
+  - Multi-Head Self-Attention机制
+  - Position Encoding（绝对位置 + 相对位置偏置）
+  - DropPath和LayerScale机制
+  - 所有类和函数都有详细的文档字符串
+
+- ✅ **model/simmim.py** - SimMIM预训练框架
+  - 掩码图像建模（Masked Image Modeling）实现
+  - 编码器-解码器架构
+  - 三种损失计算方式
+  - 重建模式支持
+  - 掩码Token的应用逻辑
+
+- ✅ **model/__init__.py** - 模型构建接口
+  - 统一的模型构建函数
+  - 预训练/微调模式自动选择
+
+**3. 数据处理模块** (2个文件)
+- ✅ **data/data_simmim.py** - 预训练数据加载
+  - 5种掩码策略的详细说明和实现
+  - MaskGenerator类
+  - Jones矩阵数据集类
+  - 数据加载器构建
+  - 分布式训练的数据采样
+
+- ✅ **data/__init__.py** - 数据加载统一接口
+  - 四种数据加载模式
+  - 模式自动选择逻辑
+
+**4. 主训练脚本** (1个文件)
+- ✅ **main_pretrain.py** - 预训练主程序
+  - 完整的训练流程注释
+  - 命令行参数详细说明
+  - 训练循环实现
+  - 重建模式支持
+  - 分布式训练配置
+  - 混合精度训练设置
+
+### 注释特点和风格
+
+#### 文件级注释
+每个已注释的文件开头都有完整的模块说明，例如：
+```python
+"""
+模块名称
+该文件的主要功能和用途的简要描述。
+
+主要组件：
+- 组件1：功能说明
+- 组件2：功能说明
+
+使用示例：
+    示例代码（如果适用）
+"""
+```
+
+#### 函数注释
+每个函数都有完整的文档字符串：
+```python
+def function_name(param1, param2):
+    """
+    函数功能的简要描述
+    
+    更详细的功能说明和实现细节。
+    
+    参数:
+        param1 (type): 参数1的类型和说明
+        param2 (type): 参数2的类型和说明
+        
+    返回:
+        return_type: 返回值的类型和说明
+        
+    抛出:
+        ExceptionType: 可能抛出的异常说明
+    """
+```
+
+#### 代码逻辑注释
+关键代码段都有清晰的行内注释：
+```python
+# 步骤1：初始化数据加载器
+# 根据配置选择预训练或微调数据
+data_loader = build_loader(config)
+
+# 步骤2：应用掩码策略
+# 掩码类型0会随机选择1-5中的一种策略
+masked_data = apply_mask(data, mask_type=0)
+```
+
+### 注释覆盖的关键概念
+
+#### 1. Vision Transformer 架构
+- **Patch Embedding**: Jones矩阵如何转换为token序列
+- **Position Encoding**: 绝对位置编码和相对位置偏置的实现原理
+- **Multi-Head Attention**: 自注意力机制的数学原理和代码实现
+- **LayerScale**: 如何稳定深层网络的训练
+- **DropPath**: 随机深度正则化的作用
+
+#### 2. SimMIM 预训练策略
+- **Mask Token**: 如何替换被掩码的patch
+- **5种掩码策略**: 每种策略的用途和适用场景
+  - 类型0: 随机选择（用于通用预训练）
+  - 类型1: 波长通道掩码（学习波长依赖关系）
+  - 类型2: 相位掩码（学习振幅-相位关系）
+  - 类型3: 极化掩码（类型1的变种）
+  - 类型4: 极化掩码（类型2的变种）
+  - 类型5: 特定极化分量掩码
+- **三种损失计算方式**: 全局、掩码部分、非掩码部分
+
+#### 3. 数据处理流程
+- **Jones矩阵格式**: `[N, 1, wavelengths, 6]` 的详细含义
+  - 6个通道分别是：`[|J11|, |J12|, |J22|, ∠J11, ∠J12, ∠J22]`
+- **数据分割策略**: 如何处理大规模数据集（~20M样本）
+- **分布式采样**: 多GPU训练时的数据分配机制
+
+#### 4. 训练优化技术
+- **层级学习率衰减**: 不同深度的层使用不同的学习率
+- **权重衰减跳过**: 哪些参数不应用权重衰减（bias、LayerNorm）
+- **梯度裁剪**: 如何防止梯度爆炸
+- **混合精度训练**: Nvidia Apex 与 PyTorch AMP 的选择
+
+### 使用建议
+
+#### 对于新用户
+1. 先阅读 `config.py` 了解所有可配置参数
+2. 阅读 `main_pretrain.py` 理解完整训练流程
+3. 阅读 `model/vision_transformer.py` 学习模型架构
+4. 阅读 `data/data_simmim.py` 了解数据格式和掩码策略
+
+#### 对于开发者
+- 每个函数都有清晰的输入输出说明
+- 关键算法有实现细节注释
+- 数据流动的shape变换都有标注
+- 可以快速定位和理解相关功能
+
+#### 对于研究者
+- 注释详细说明了各种设计选择的原因
+- 关键组件（位置编码、注意力机制等）有详细解释
+- 不同掩码策略的对比和使用场景
+- 超参数的影响和调优建议
+
+### 持续更新
+
+代码注释工作仍在持续进行中。未来将逐步完成以下文件的注释：
+
+**即将完成** (短期):
+- `main_finetune.py` - 微调主程序
+- `main_metalens.py` - 金属透镜设计主程序
+- `data/data_finetune.py` - 微调数据加载
+- `data/data_recon.py` - 重建数据加载
+
+**计划中** (中期):
+- `preprocess/` 模块下的所有文件
+- `evaluation/` 模块下的所有文件
+
+详细的代码注释说明请参阅：[代码注释说明.md](代码注释说明.md)
 
 ---
 

@@ -1,3 +1,17 @@
+"""
+微调主程序
+该文件是MetasurfaceVIT项目的微调主程序，用于：
+1. 使用预训练的Vision Transformer模型进行微调
+2. 从Jones矩阵预测超表面结构参数
+3. 支持单GPU和分布式多GPU训练
+4. 支持混合精度训练（Nvidia Apex或PyTorch AMP）
+5. 支持评估模式以预测新的Jones矩阵对应的结构参数
+
+主要功能：
+- 微调：加载预训练权重并在微调数据集上训练
+- 评估：使用训练好的模型预测结构参数
+- 吞吐量测试：测试模型的推理速度
+"""
 
 import os
 import time
@@ -23,40 +37,72 @@ from torch.cuda.amp import autocast, GradScaler
 
 
 def parse_option():
-    parser = argparse.ArgumentParser('MetaVIT finetune&evaluation', add_help=False)
+    """
+    解析命令行参数
+    
+    该函数解析微调和评估模式下的所有命令行参数，包括：
+    - 训练超参数（epoch、学习率、批次大小等）
+    - 数据配置（数据路径、文件夹名称等）
+    - 预训练模型路径
+    - 混合精度训练配置
+    - 分布式训练配置
+    - 评估模式配置
+    
+    返回:
+        args: 解析后的命令行参数对象
+        config: 根据参数构建的配置对象
+    """
+    parser = argparse.ArgumentParser('MetaVIT 微调与评估', add_help=False)
+    
+    # 通用配置参数
     parser.add_argument(
         "--opts",
-        help="Modify config options by adding 'KEY VALUE' pairs. ",
+        help="通过添加'KEY VALUE'对来修改配置选项",
         default=None,
         nargs='+',
     )
 
-    parser.add_argument('--epoch', type=int, help="total epoch")
-    parser.add_argument('--batch-size', type=int, help="batch size for single GPU")
-    parser.add_argument('--data_path', type=str, help='finetune training data path (data_path + data_folder_name)')
-    parser.add_argument('--data_folder_name', type=str, help='path to dataset')
-    # manually write in resume model path
-    parser.add_argument('--resume', help='resume from checkpoint')
-    parser.add_argument('--accumulation-steps', type=int, help="gradient accumulation steps")
+    # 训练超参数
+    parser.add_argument('--epoch', type=int, help="总训练轮数")
+    parser.add_argument('--batch-size', type=int, help="单GPU的批次大小")
+    
+    # 数据配置
+    parser.add_argument('--data_path', type=str, help='微调训练数据路径（data_path + data_folder_name）')
+    parser.add_argument('--data_folder_name', type=str, help='数据集路径')
+    
+    # 模型恢复和预训练
+    parser.add_argument('--resume', help='从检查点恢复训练')
+    
+    # 训练优化参数
+    parser.add_argument('--accumulation-steps', type=int, help="梯度累积步数")
     parser.add_argument('--use-checkpoint', action='store_true',
-                        help="whether to use gradient checkpointing to save memory")
+                        help="是否使用梯度检查点以节省内存")
+    
+    # 混合精度训练参数
     parser.add_argument('--amp_type', type=str, default='apex',
-                        help="type of automatic mix precision (amp). apex for nvidia apex.amp, pytorch for pytorch.amp")
+                        help="自动混合精度类型：apex为nvidia apex.amp，pytorch为pytorch.amp")
     parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O1', 'O2'],
-                        help='mixed precision opt level, if O0, no amp is used')
+                        help='混合精度优化级别，O0表示不使用amp')
+    
+    # 输出和实验配置
     parser.add_argument('--output', default='finetune_output', type=str, metavar='PATH',
-                        help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
-    # the following is pretrained output path:
+                        help='输出文件夹根路径，完整路径为<output>/<model_name>/<tag>（默认：finetune_output）')
     parser.add_argument('--pretrained_output', default='output', type=str, metavar='PATH',
-                        help='model files. root of pretrained output folder')
+                        help='预训练模型文件的根路径')
     parser.add_argument('--eval_output', type=str,
-                        help='path to place evaluation results (not model files but data files)')
-    parser.add_argument('--tag', help='tag of experiment')
-    parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    parser.add_argument('--throughput', action='store_true', help='Test throughput only')
-    parser.add_argument("--local_rank", default=0, type=int, help='local rank for DistributedDataParallel')
-    parser.add_argument('--recon_type', type=int, help="the design type 1-4 determined during metasurface design")
-    parser.add_argument('--treatment', help="manually input the time stamp ( e.g. 2024-10-14) you wanna use for params prediction")
+                        help='放置评估结果的路径（数据文件而非模型文件）')
+    parser.add_argument('--tag', help='实验标签')
+    
+    # 模式选择
+    parser.add_argument('--eval', action='store_true', help='仅执行评估')
+    parser.add_argument('--throughput', action='store_true', help='仅测试吞吐量')
+    
+    # 分布式训练参数
+    parser.add_argument("--local_rank", default=0, type=int, help='分布式数据并行的本地进程编号')
+    
+    # 评估相关参数
+    parser.add_argument('--recon_type', type=int, help="超表面设计期间确定的设计类型1-4")
+    parser.add_argument('--treatment', help="手动输入要用于参数预测的时间戳（例如2024-10-14）")
 
     args = parser.parse_args()
 
@@ -66,51 +112,85 @@ def parse_option():
 
 
 def main(config):
+    """
+    主微调或评估函数
+    
+    该函数执行两种模式之一：
+    1. 微调模式：加载预训练模型并在结构参数预测任务上微调
+    2. 评估模式：使用训练好的模型预测重建Jones矩阵对应的结构参数
+    
+    参数:
+        config: 配置对象，包含所有训练和模型参数
+    
+    工作流程：
+        - 构建训练和验证数据加载器
+        - 创建模型（Vision Transformer用于回归任务）
+        - 设置优化器、损失函数和学习率调度器
+        - 配置分布式训练（如果使用多GPU）
+        - 加载预训练权重
+        - 执行微调或评估
+    """
+    # 构建数据加载器
     dataset_train, dataset_val, data_loader_train, data_loader_val = build_loader(config, logger, type='finetune')
-    logger.info(f"Creating model:{config.MODEL.NAME}")
+    
+    # 创建模型（微调模式：用于结构参数回归）
+    logger.info(f"创建模型：{config.MODEL.NAME}")
     model = build_model(config, is_pretrain=False)
     model.cuda()
     logger.info(str(model))
 
+    # 构建优化器（使用层级学习率衰减）
     optimizer = build_optimizer(config, model, logger, is_pretrain=False)
+    
+    # 配置混合精度训练
     if config.AMP_OPT_LEVEL != "O0":
         model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
+    
+    # 配置分布式数据并行
     if torch.cuda.device_count() != 1:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
         model_without_ddp = model.module
     else:
         model_without_ddp = model
 
+    # 计算并记录模型参数量
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"number of params: {n_parameters}")
+    logger.info(f"参数数量：{n_parameters}")
     if hasattr(model_without_ddp, 'flops'):
         flops = model_without_ddp.flops()
-        logger.info(f"number of GFLOPs: {flops / 1e9}")
+        logger.info(f"GFLOPs数量：{flops / 1e9}")
 
+    # 构建学习率调度器
     lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
 
+    # 定义损失函数（平滑L1损失，对异常值更鲁棒）
     criterion = torch.nn.SmoothL1Loss()
 
+    # 自动恢复训练
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT, logger)
         if resume_file:
             if config.MODEL.RESUME:
-                logger.warning(f"auto-resume changing resume file from {config.MODEL.RESUME} to {resume_file}")
+                logger.warning(f"自动恢复将检查点从{config.MODEL.RESUME}更改为{resume_file}")
             config.defrost()
             config.MODEL.RESUME = resume_file
             config.freeze()
-            logger.info(f'auto resuming from {resume_file}')
+            logger.info(f'从{resume_file}自动恢复')
         else:
-            logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
+            logger.info(f'在{config.OUTPUT}中未找到检查点，忽略自动恢复')
 
+    # 加载检查点或预训练权重
     if config.MODEL.RESUME:
         load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
+        
+        # 评估模式：预测结构参数
         if config.EVAL_MODE:
             dataset_pred, data_loader_pred = build_loader(config, logger, type='predict')
             predict_para, loss = validate(config, data_loader_pred, model)
-            logger.info(f"LOSS of the network on the {len(dataset_pred)} recon images: {loss:.1f}%")
-            # for config.eval_mode, save data and directly return.
-            # predict path was hard coded in config.py.
+            logger.info(f"网络在{len(dataset_pred)}个重建图像上的损失：{loss:.1f}%")
+            
+            # 保存预测的参数（路径在config.py中硬编码）
             np.savetxt(config.PREDICT_PARA_PATH + 'type_' + str(config.RECON_TYPE) + '_'
                        + config.TREATMENT + '.txt', predict_para, fmt='%.3f')
             return
